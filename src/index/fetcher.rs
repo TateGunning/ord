@@ -1,16 +1,17 @@
 use {
-  crate::Options,
-  anyhow::{anyhow, Result},
-  base64::Engine,
-  bitcoin::{Transaction, Txid},
-  hyper::{client::HttpConnector, Body, Client, Method, Request, Uri},
-  serde::Deserialize,
+  super::*,
+  http_body_util::{BodyExt, Full},
+  hyper::{body::Bytes, Method, Request, Uri},
+  hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+  },
   serde_json::{json, Value},
 };
 
 pub(crate) struct Fetcher {
   auth: String,
-  client: Client<HttpConnector>,
+  client: Client<HttpConnector, Full<Bytes>>,
   url: Uri,
 }
 
@@ -28,23 +29,20 @@ struct JsonError {
 }
 
 impl Fetcher {
-  pub(crate) fn new(options: &Options) -> Result<Self> {
-    let client = Client::new();
+  pub(crate) fn new(settings: &Settings) -> Result<Self> {
+    let client = Client::builder(TokioExecutor::new()).build_http();
 
-    let url = if options.rpc_url().starts_with("http://") {
-      options.rpc_url()
+    let url = if settings.bitcoin_rpc_url(None).starts_with("http://") {
+      settings.bitcoin_rpc_url(None)
     } else {
-      "http://".to_string() + &options.rpc_url()
+      "http://".to_string() + &settings.bitcoin_rpc_url(None)
     };
 
     let url = Uri::try_from(&url).map_err(|e| anyhow!("Invalid rpc url {url}: {e}"))?;
 
-    let (user, password) = options.auth()?.get_user_pass()?;
+    let (user, password) = settings.bitcoin_credentials()?.get_user_pass()?;
     let auth = format!("{}:{}", user.unwrap(), password.unwrap());
-    let auth = format!(
-      "Basic {}",
-      &base64::engine::general_purpose::STANDARD.encode(auth)
-    );
+    let auth = format!("Basic {}", &base64_encode(auth.as_bytes()));
     Ok(Fetcher { client, url, auth })
   }
 
@@ -82,10 +80,7 @@ impl Fetcher {
 
           log::info!("failed to fetch raw transactions, retrying: {}", error);
 
-          tokio::time::sleep(tokio::time::Duration::from_millis(
-            100 * u64::pow(2, retries),
-          ))
-          .await;
+          tokio::time::sleep(Duration::from_millis(100 * u64::pow(2, retries))).await;
           retries += 1;
           continue;
         }
@@ -116,7 +111,7 @@ impl Fetcher {
               .map_err(|e| anyhow!("Result for batched JSON-RPC response not valid hex: {e}"))
           })
           .and_then(|hex| {
-            bitcoin::consensus::deserialize(&hex).map_err(|e| {
+            consensus::deserialize(&hex).map_err(|e| {
               anyhow!("Result for batched JSON-RPC response not valid bitcoin tx: {e}")
             })
           })
@@ -131,11 +126,11 @@ impl Fetcher {
       .uri(&self.url)
       .header(hyper::header::AUTHORIZATION, &self.auth)
       .header(hyper::header::CONTENT_TYPE, "application/json")
-      .body(Body::from(body))?;
+      .body(Full::new(Bytes::from(body)))?;
 
     let response = self.client.request(req).await?;
 
-    let buf = hyper::body::to_bytes(response).await?;
+    let buf = response.into_body().collect().await?.to_bytes();
 
     let results: Vec<JsonResponse<String>> = match serde_json::from_slice(&buf) {
       Ok(results) => results,

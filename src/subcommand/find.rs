@@ -21,18 +21,25 @@ pub struct FindRangeOutput {
 }
 
 impl Find {
-  pub(crate) fn run(self, options: Options) -> SubcommandResult {
-    let index = Index::open(&options)?;
+  pub(crate) fn run(self, settings: Settings) -> SubcommandResult {
+    let index = Index::open(&settings)?;
+
+    if !index.has_sat_index() {
+      bail!("find requires index created with `--index-sats` flag");
+    }
 
     index.update()?;
 
     match self.end {
-      Some(end) => match index.find_range(self.sat.0, end.0)? {
-        Some(result) => Ok(Box::new(result)),
+      Some(end) => match index.find_range(self.sat, end)? {
+        Some(mut results) => {
+          results.sort_by_key(|find_range_output| find_range_output.start);
+          Ok(Some(Box::new(results)))
+        }
         None => Err(anyhow!("range has not been mined as of index height")),
       },
-      None => match index.find(self.sat.0)? {
-        Some(satpoint) => Ok(Box::new(Output { satpoint })),
+      None => match index.find(self.sat)? {
+        Some(satpoint) => Ok(Some(Box::new(Output { satpoint }))),
         None => Err(anyhow!("sat has not been mined as of index height")),
       },
     }

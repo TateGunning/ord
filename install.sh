@@ -1,53 +1,64 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 
-set -euo pipefail
-if [ ! -z ${GITHUB_ACTIONS-} ]; then
+set -eu
+
+if [ -n "${GITHUB_ACTIONS-}" ]; then
   set -x
 fi
+
+# Check pipefail support in a subshell, ignore if unsupported
+# shellcheck disable=SC3040
+(set -o pipefail 2> /dev/null) && set -o pipefail
 
 help() {
   cat <<'EOF'
 Install a binary release of ord hosted on GitHub
 
 USAGE:
-    install [options]
+    install.sh [options]
 
 FLAGS:
     -h, --help      Display this message
     -f, --force     Force overwriting an existing binary
 
 OPTIONS:
-    --tag TAG       Tag (version) of the crate to install, defaults to latest release
+    --tag TAG       Tag (version) to install, defaults to latest release
     --to LOCATION   Where to install the binary [default: ~/bin]
     --target TARGET
 EOF
 }
 
-git=ordinals/ord
 crate=ord
 url=https://github.com/ordinals/ord
 releases=$url/releases
 
 say() {
-  echo "install: $@"
-}
-
-say_err() {
-  say "$@" >&2
+  echo "install: $*" >&2
 }
 
 err() {
-  if [ ! -z ${td-} ]; then
-    rm -rf $td
+  if [ -n "${td-}" ]; then
+    rm -rf "$td"
   fi
 
-  say_err "error: $@"
+  say "error: $*"
   exit 1
 }
 
 need() {
-  if ! command -v $1 > /dev/null 2>&1; then
+  if ! command -v "$1" > /dev/null 2>&1; then
     err "need $1 (command not found)"
+  fi
+}
+
+download() {
+  url="$1"
+  output="$2"
+
+  if command -v curl > /dev/null; then
+    curl --proto =https --tlsv1.2 -sSfL "$url" "-o$output"
+  else
+    wget --https-only --secure-protocol=TLSv1_2 --quiet "$url" "-O$output"
   fi
 }
 
@@ -74,71 +85,97 @@ while test $# -gt 0; do
       shift
       ;;
     *)
+      say "error: unrecognized argument '$1'. Usage:"
+      help
+      exit 1
       ;;
   esac
   shift
 done
 
-# Dependencies
-need curl
-need install
+command -v curl > /dev/null 2>&1 ||
+  command -v wget > /dev/null 2>&1 ||
+  err "need wget or curl (command not found)"
+
 need mkdir
 need mktemp
-need tar
 
-# Optional dependencies
-if [ -z ${tag-} ]; then
+if [ -z "${tag-}" ]; then
+  need grep
   need cut
-  need rev
 fi
 
-if [ -z ${dest-} ]; then
+if [ -z "${target-}" ]; then
+  need cut
+fi
+
+if [ -z "${dest-}" ]; then
   dest="$HOME/bin"
 fi
 
-if [ -z ${tag-} ]; then
-  tag=$(curl --proto =https --tlsv1.2 -sSf https://api.github.com/repos/ordinals/ord/releases/latest |
+if [ -z "${tag-}" ]; then
+  tag=$(
+    download https://api.github.com/repos/ordinals/ord/releases/latest - |
     grep tag_name |
     cut -d'"' -f4
   )
 fi
 
-if [ -z ${target-} ]; then
-  uname_target=`uname -m`-`uname -s`
+if [ -z "${target-}" ]; then
+  # bash compiled with MINGW (e.g. git-bash, used in github windows runners),
+  # unhelpfully includes a version suffix in `uname -s` output, so handle that.
+  # e.g. MINGW64_NT-10-0.19044
+  kernel=$(uname -s | cut -d- -f1)
+  uname_target="$(uname -m)-$kernel"
 
   case $uname_target in
     arm64-Darwin) target=aarch64-apple-darwin;;
     x86_64-Darwin) target=x86_64-apple-darwin;;
     x86_64-Linux) target=x86_64-unknown-linux-gnu;;
+    x86_64-MINGW64_NT) target=x86_64-pc-windows-msvc;;
+    x86_64-Windows_NT) target=x86_64-pc-windows-msvc;;
     *)
-      err 'Could not determine target from output of `uname -m`-`uname -s`, please use `--target`:' $uname_target
-      err 'Target architecture is not supported by this install script.'
-      err 'Consider opening an issue or building from source: https://github.com/ordinals/ord'
+      # shellcheck disable=SC2016
+      err 'Could not determine target from output of `uname -m`-`uname -s`, please use `--target`:' "$uname_target"
     ;;
   esac
 fi
 
-archive="$releases/download/$tag/$crate-$tag-$target.tar.gz"
+case $target in
+  x86_64-pc-windows-msvc)
+    extension=zip
+    need unzip
+    ;;
+  *)
+    extension=tar.gz
+    need tar
+    ;;
+esac
 
-say_err "Repository:  $url"
-say_err "Crate:       $crate"
-say_err "Tag:         $tag"
-say_err "Target:      $target"
-say_err "Destination: $dest"
-say_err "Archive:     $archive"
+archive="$releases/download/$tag/$crate-$tag-$target.$extension"
+
+say "Repository:  $url"
+say "Crate:       $crate"
+say "Tag:         $tag"
+say "Target:      $target"
+say "Destination: $dest"
+say "Archive:     $archive"
 
 td=$(mktemp -d || mktemp -d -t tmp)
-curl --proto =https --tlsv1.2 -sSfL $archive | tar -C $td -xz
 
-for f in $(ls $td); do
-  test -x $td/$f || continue
+if [ "$extension" = "zip" ]; then
+  download "$archive" "$td/ord.zip"
+  unzip -jd "$td" "$td/ord.zip"
+else
+  download "$archive" - | tar --directory "$td" --strip-components 1 -xz
+fi
 
-  if [ -e "$dest/$f" ] && [ $force = false ]; then
-    err "$f already exists in $dest"
-  else
-    mkdir -p $dest
-    install -m 755 $td/$f $dest
-  fi
-done
+if [ -e "$dest/ord" ] && [ "$force" = false ]; then
+  err "\`$dest/ord\` already exists"
+else
+  mkdir -p "$dest"
+  cp "$td/ord" "$dest/ord"
+  chmod 755 "$dest/ord"
+fi
 
-rm -rf $td
+rm -rf "$td"
