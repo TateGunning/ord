@@ -732,6 +732,7 @@ impl Server {
   ) -> ServerResult {
     task::block_in_place(|| {
       let inscriptions = index.get_inscription_ids_by_sat(sat)?;
+
       let satpoint = index.rare_sat_satpoint(sat)?.or_else(|| {
         inscriptions.first().and_then(|&first_inscription_id| {
           index
@@ -740,7 +741,10 @@ impl Server {
             .flatten()
         })
       });
+
       let blocktime = index.block_time(sat.height())?;
+
+      let block = index.block_header_at_height(sat.height())?;
 
       let charms = sat.charms();
 
@@ -789,6 +793,7 @@ impl Server {
       } else {
         SatHtml {
           address,
+          block,
           blocktime,
           inscriptions,
           sat,
